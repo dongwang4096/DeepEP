@@ -107,6 +107,14 @@ class Buffer:
             assert num_qps_per_rank > 0
             os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
             os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+            os.environ.setdefault('NVSHMEM_IBGDA_NIC_HANDLER', 'auto')
+            # Pin each GPU process to its topologically closest NIC via DEEPEP_NIC_DEVICES env var
+            local_dev_id = self.runtime.get_local_device_id()
+            nic_list = os.environ.get('DEEPEP_NIC_DEVICES', None)
+            if nic_list:
+                nics = nic_list.split(',')
+                if local_dev_id < len(nics):
+                    os.environ['NVSHMEM_IB_DEVICES'] = nics[local_dev_id].strip()
             os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
 
             # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check

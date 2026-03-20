@@ -75,6 +75,14 @@ __device__ static __forceinline__ nvshmemi_ibgda_device_state_t* ibgda_get_state
     return &nvshmemi_ibgda_device_state_d;
 }
 
+__device__ static __forceinline__ bool ibgda_use_async_postsend() {
+#ifdef DEEPEP_FORCE_CPU_DOORBELL
+    return true;
+#else
+    return ibgda_get_state()->use_async_postsend;
+#endif
+}
+
 // Template helper to get RC - uses compile-time type checking with if constexpr (C++17)
 template <typename StateType>
 __device__ static __forceinline__ nvshmemi_ibgda_device_qp_t* ibgda_get_rc_impl(StateType* state, int pe, int id) {
@@ -155,25 +163,35 @@ __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_devi
                                                              uint64_t base_wqe_idx,
                                                              uint32_t num_wqes,
                                                              int message_idx = 0) {
-    auto state = ibgda_get_state();
     nvshmemi_ibgda_device_qp_management_t* mvars = &qp->mvars;
     uint64_t new_wqe_idx = base_wqe_idx + num_wqes;
+    const bool use_async = ibgda_use_async_postsend();
 
     // WQE writes must be finished first
     __threadfence();
 
     unsigned long long int* ready_idx =
-        (unsigned long long int*)(state->use_async_postsend ? qp->tx_wq.prod_idx : &mvars->tx_wq.ready_head);
+        (unsigned long long int*)(&mvars->tx_wq.ready_head);
 
     // Wait for prior WQE slots to be filled first
     while (atomicCAS(ready_idx, base_wqe_idx, new_wqe_idx) != base_wqe_idx)
         ;
 
-    // Always post, not in batch
-    if (!state->use_async_postsend) {
+    if (!use_async) {
+        // GPU doorbell path
         constexpr int kNumRequestInBatch = 4;
         if (kAlwaysDoPostSend or (message_idx + 1) % kNumRequestInBatch == 0)
             ibgda_post_send(qp, new_wqe_idx);
+    } else {
+        // CPU doorbell path: update prod_idx and notify CPU thread via bf
+        uint64_t old_prod_idx = atomicMax(
+            reinterpret_cast<unsigned long long int*>(&mvars->tx_wq.prod_idx),
+            (unsigned long long int)new_wqe_idx);
+        if (new_wqe_idx > old_prod_idx) {
+            atomicMax_system(
+                reinterpret_cast<unsigned long long int*>(qp->tx_wq.bf),
+                (unsigned long long int)new_wqe_idx);
+        }
     }
 }
 
@@ -498,8 +516,7 @@ __device__ static __forceinline__ void ibgda_poll_cq(nvshmemi_ibgda_device_cq_t*
 // Wait until wqe `idx - 1` is completed.
 __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_id) {
     auto qp = ibgda_get_rc(dst_pe, qp_id);
-    auto state = ibgda_get_state();
-    uint64_t prod_idx = state->use_async_postsend ? ld_na_relaxed(qp->tx_wq.prod_idx) : ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
+    uint64_t prod_idx = ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
     ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
 }
 
