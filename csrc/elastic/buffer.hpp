@@ -184,8 +184,9 @@ public:
     }
 
     static constexpr int kCFTCountedDispatchMaxTokensPerRank = 256;
+    static constexpr int kCFTCountedCombineMaxTokensPerRank = 256;
 
-    bool supports_counted_dispatch() const {
+    bool supports_counted_scaleup() const {
 #if (defined(CUDART_VERSION) and CUDART_VERSION >= 13030) or (defined(CUDA_VERSION) and CUDA_VERSION >= 13030)
         return nccl_context->is_scaleup_nvlink and
                nccl_context->supports_counted_scaleup_le() and
@@ -195,16 +196,28 @@ public:
 #endif
     }
 
-    bool is_counted_dispatch_ready() const {
+    bool supports_counted_dispatch() const {
+        return supports_counted_scaleup();
+    }
+
+    bool is_counted_scaleup_ready() const {
         return nccl_context->is_counted_scaleup_le_ready();
     }
 
-    pybind11::bytes export_counted_dispatch_le_handle() {
+    bool is_counted_dispatch_ready() const {
+        return is_counted_scaleup_ready();
+    }
+
+    pybind11::bytes export_counted_scaleup_le_handle() {
         const auto handle = nccl_context->export_counted_scaleup_le_handle();
         return pybind11::bytes(reinterpret_cast<const char*>(handle.data()), handle.size());
     }
 
-    void import_counted_dispatch_le_handles(const std::vector<std::string>& handles) {
+    pybind11::bytes export_counted_dispatch_le_handle() {
+        return export_counted_scaleup_le_handle();
+    }
+
+    void import_counted_scaleup_le_handles(const std::vector<std::string>& handles) {
         std::vector<std::vector<uint8_t>> handle_bytes;
         handle_bytes.reserve(handles.size());
         for (const auto& handle: handles)
@@ -213,6 +226,10 @@ public:
         nccl_context->import_counted_scaleup_le_handles(
             handle_bytes,
             workspace_layout_wo_expert->get_counted_scaleup_le_id_ptr(0));
+    }
+
+    void import_counted_dispatch_le_handles(const std::vector<std::string>& handles) {
+        import_counted_scaleup_le_handles(handles);
     }
 
     // ReSharper disable once CppMemberFunctionMayBeStatic
@@ -623,9 +640,9 @@ public:
         }
     }
 
-    static bool may_use_cft_counted_dispatch(const int& num_scaleout_ranks,
-                                             const int& num_scaleup_ranks,
-                                             const int& num_nvl_ranks) {
+    static bool may_use_cft_counted_scaleup(const int& num_scaleout_ranks,
+                                            const int& num_scaleup_ranks,
+                                            const int& num_nvl_ranks) {
 #if (defined(CUDART_VERSION) and CUDART_VERSION >= 13030) or (defined(CUDA_VERSION) and CUDA_VERSION >= 13030)
         return num_scaleout_ranks == 1 and
                num_scaleup_ranks == num_nvl_ranks and
@@ -635,10 +652,17 @@ public:
 #endif
     }
 
+    static bool may_use_cft_counted_dispatch(const int& num_scaleout_ranks,
+                                             const int& num_scaleup_ranks,
+                                             const int& num_nvl_ranks) {
+        return may_use_cft_counted_scaleup(num_scaleout_ranks, num_scaleup_ranks, num_nvl_ranks);
+    }
+
     static int64_t get_combine_buffer_size(const int& num_max_tokens_per_rank, const int& hidden, const int& num_topk,
                                            const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                                            const bool& is_scaleup_nvlink,
-                                           const bool& allow_multiple_reduction) {
+                                           const bool& allow_multiple_reduction,
+                                           const bool& use_cft_counted = false) {
         const auto num_ranks = num_scaleup_ranks * num_scaleout_ranks;
         const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
 
@@ -652,7 +676,11 @@ public:
                 num_max_tokens_per_rank * (allow_multiple_reduction ? 1 : num_topk));
             const auto recv_buffer_layout = layout::BufferLayout<false>(
                 token_layout, num_tokens_in_layout, num_max_tokens_per_rank);
-            return send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes();
+            const auto data_bytes = send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes();
+            if (not use_cft_counted)
+                return data_bytes;
+            return math::align<int64_t>(data_bytes, layout::CounterLayout::kCounterStrideBytes) +
+                   layout::CounterLayout::get_num_bytes(num_scaleup_ranks);
         } else {
             // Hybrid combine
             const int num_tokens_in_scaleup_layout = allow_multiple_reduction ? std::min(num_scaleup_ranks, num_topk) : num_topk;
@@ -696,13 +724,14 @@ public:
             num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, elem_size,
             num_scaleout_ranks, num_scaleup_ranks,
             is_scaleup_nvlink,
-            may_use_cft_counted_dispatch(num_scaleout_ranks, num_scaleup_ranks, num_nvl_ranks));
+            may_use_cft_counted_scaleup(num_scaleout_ranks, num_scaleup_ranks, num_nvl_ranks));
 
         // Combine layout
         const auto num_combine_bytes = get_combine_buffer_size(
             num_max_tokens_per_rank, hidden, num_topk,
             num_scaleout_ranks, num_scaleup_ranks,
-            is_scaleup_nvlink, allow_multiple_reduction);
+            is_scaleup_nvlink, allow_multiple_reduction,
+            may_use_cft_counted_scaleup(num_scaleout_ranks, num_scaleup_ranks, num_nvl_ranks));
 
         // Return the maximum of those layouts, aligned to 2 MB
         return math::align(std::max(num_dispatch_bytes, num_combine_bytes), symmetric::kNumAlignmentBytes);
@@ -988,8 +1017,8 @@ public:
             nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
             nccl_context->is_scaleup_nvlink, true);
         const bool use_cft_counted_dispatch =
-            supports_counted_dispatch() and
-            nccl_context->is_counted_scaleup_le_ready() and
+            supports_counted_scaleup() and
+            is_counted_scaleup_ready() and
             num_tokens <= kCFTCountedDispatchMaxTokensPerRank and
             counted_dispatch_buffer_bytes <= num_buffer_bytes;
         auto counted_scaleup_le_ids = use_cft_counted_dispatch ?
@@ -1280,10 +1309,26 @@ public:
         // All new tensor allocations should happen after this
         const auto compute_stream = stream_control_prologue(previous_event, allocate_on_comm_stream, async_with_compute_stream);
 
+        const auto counted_combine_buffer_bytes = get_combine_buffer_size(
+            num_max_tokens_per_rank, hidden, num_topk,
+            nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+            nccl_context->is_scaleup_nvlink, allow_multiple_reduction, true);
+        const bool use_cft_counted_combine =
+            supports_counted_scaleup() and
+            is_counted_scaleup_ready() and
+            nccl_context->num_scaleout_ranks == 1 and
+            nccl_context->is_scaleup_nvlink and
+            not (use_expanded_layout and not allow_multiple_reduction) and
+            num_combined_tokens <= kCFTCountedCombineMaxTokensPerRank and
+            counted_combine_buffer_bytes <= num_buffer_bytes;
+        auto counted_scaleup_le_ids = use_cft_counted_combine ?
+            workspace_layout_wo_expert->get_counted_scaleup_le_id_ptr(0) : nullptr;
+
         // Check buffer size
         EP_HOST_ASSERT(get_combine_buffer_size(num_max_tokens_per_rank, hidden, num_topk,
                                                nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
-                                               nccl_context->is_scaleup_nvlink, allow_multiple_reduction) <= num_buffer_bytes);
+                                               nccl_context->is_scaleup_nvlink, allow_multiple_reduction,
+                                               use_cft_counted_combine) <= num_buffer_bytes);
 
         // Optional configs and metadata for hybrid combine
         int num_channels = 1;
@@ -1316,12 +1361,13 @@ public:
             x.data_ptr(),
             topk_weights.has_value() ? topk_weights->data_ptr() : nullptr,
             src_metadata.data_ptr<int>(),
+            combined_topk_idx.data_ptr<topk_idx_t>(),
             psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
             token_metadata_at_forward_ptr,
             channel_linked_list_ptr,
             nccl_context->dev_comm, nccl_context->window,
             buffer, workspace,
-            num_reduced_tokens, num_max_tokens_per_rank,
+            num_reduced_tokens, num_combined_tokens, num_max_tokens_per_rank,
             hidden, num_experts, num_topk,
             num_qps, num_gpu_timeout_cycles,
             nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
@@ -1330,6 +1376,7 @@ public:
             num_sms, jit::device_runtime->get_num_smem_bytes(),
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
+            use_cft_counted_combine, counted_scaleup_le_ids,
             comm_stream);
 
         // Allocate output tensors
@@ -1380,6 +1427,10 @@ static void register_apis(pybind11::module_& m) {
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
         .def("get_logical_domain_size", &ElasticBuffer::get_logical_domain_size)
+        .def("supports_counted_scaleup", &ElasticBuffer::supports_counted_scaleup)
+        .def("is_counted_scaleup_ready", &ElasticBuffer::is_counted_scaleup_ready)
+        .def("export_counted_scaleup_le_handle", &ElasticBuffer::export_counted_scaleup_le_handle)
+        .def("import_counted_scaleup_le_handles", &ElasticBuffer::import_counted_scaleup_le_handles)
         .def("supports_counted_dispatch", &ElasticBuffer::supports_counted_dispatch)
         .def("is_counted_dispatch_ready", &ElasticBuffer::is_counted_dispatch_ready)
         .def("export_counted_dispatch_le_handle", &ElasticBuffer::export_counted_dispatch_le_handle)

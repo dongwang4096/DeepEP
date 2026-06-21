@@ -233,33 +233,36 @@ class ElasticBuffer:
         # Physical rank indices
         self.num_rdma_ranks, self.num_nvlink_ranks = self.get_physical_domain_size()
 
-        # Prepare counted-dispatch LE IDs internally. This keeps the public dispatch API unchanged.
-        self._counted_dispatch_ready = False
-        self._setup_counted_dispatch()
+        # Prepare counted scale-up LE IDs internally. This keeps public APIs unchanged.
+        self._counted_scaleup_ready = False
+        self._counted_dispatch_ready = False  # Backward-compatible debug attribute.
+        self._setup_counted_scaleup()
 
         # Call a barrier to ensure initialization visibility for all peers
         torch.cuda.synchronize()
         group.barrier()
         torch.cuda.synchronize()
 
-    def _setup_counted_dispatch(self) -> None:
-        if os.environ.get('EP_USE_COUNTED_DISPATCH', '1') == '0':
+    def _setup_counted_scaleup(self) -> None:
+        # `EP_USE_COUNTED_DISPATCH` is kept as a compatibility alias for existing scripts.
+        if os.environ.get('EP_USE_COUNTED_OPS', os.environ.get('EP_USE_COUNTED_DISPATCH', '1')) == '0':
             return
 
-        local_supported = self.runtime.supports_counted_dispatch()
+        local_supported = self.runtime.supports_counted_scaleup()
         supported_by_rank = [None] * self.num_ranks
         dist.all_gather_object(supported_by_rank, local_supported, self.group)
 
         if not any(supported_by_rank):
             return
         if not all(supported_by_rank):
-            raise RuntimeError(f'Counted dispatch support is inconsistent across ranks: {supported_by_rank}')
+            raise RuntimeError(f'Counted scale-up support is inconsistent across ranks: {supported_by_rank}')
 
-        local_handle = bytes(self.runtime.export_counted_dispatch_le_handle())
+        local_handle = bytes(self.runtime.export_counted_scaleup_le_handle())
         handles = [None] * self.num_ranks
         dist.all_gather_object(handles, local_handle, self.group)
-        self.runtime.import_counted_dispatch_le_handles(handles)
-        self._counted_dispatch_ready = self.runtime.is_counted_dispatch_ready()
+        self.runtime.import_counted_scaleup_le_handles(handles)
+        self._counted_scaleup_ready = self.runtime.is_counted_scaleup_ready()
+        self._counted_dispatch_ready = self._counted_scaleup_ready
 
     def destroy(self) -> None:
         """
