@@ -367,6 +367,21 @@ __forceinline__ __device__ dtype_t ld_acquire_sys(const dtype_t* ptr) {
 }
 
 template <typename dtype_t>
+__forceinline__ __device__ dtype_t ld_relaxed_sys(const dtype_t* ptr) {
+    if constexpr (sizeof(dtype_t) == 4) {
+        uint32_t value;
+        asm volatile("ld.relaxed.sys.L1::no_allocate.global.u32 %0, [%1];" : "=r"(value) : "l"(ptr));
+        return reinterpret_cast<const dtype_t&>(value);
+    } else if constexpr (sizeof(dtype_t) == 8) {
+        uint64_t value;
+        asm volatile("ld.relaxed.sys.L1::no_allocate.global.u64 %0, [%1];" : "=l"(value) : "l"(ptr));
+        return reinterpret_cast<const dtype_t&>(value);
+    } else {
+        EP_STATIC_ASSERT(sizeof(dtype_t) == 4 or sizeof(dtype_t) == 8, "Invalid data type length");
+    }
+}
+
+template <typename dtype_t>
 __forceinline__ __device__ void st_relaxed_sys(void* ptr, dtype_t value) {
     if constexpr (sizeof(dtype_t) == 4) {
         uint32_t int_value = reinterpret_cast<const uint32_t&>(value);

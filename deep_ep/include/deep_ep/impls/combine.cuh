@@ -178,20 +178,7 @@ combine_impl(nv_bfloat16* x,
             for (int src_rank_idx = wait_thread_idx; src_rank_idx < kNumRanks; src_rank_idx += num_wait_threads) {
                 const auto expected_bytes = get_expected_receive_bytes_by_topk(src_rank_idx);
                 const auto counter_ptr = counter_layout.get_counter_ptr(src_rank_idx);
-                comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                    const auto counter = ptx::ld_acquire_sys(counter_ptr);
-                    if (counter >= expected_bytes)
-                        return true;
-
-                    if (is_last_check) {
-                        printf("DeepEP counted combine counter wait timeout, rank: %d/%d, "
-                               "src rank: %d, counter: %llu, expected bytes: %llu\n",
-                               rank_idx, kNumRanks, src_rank_idx,
-                               static_cast<unsigned long long>(counter),
-                               static_cast<unsigned long long>(expected_bytes));
-                    }
-                    return false;
-                });
+                while (ptx::ld_relaxed_sys(counter_ptr) < expected_bytes) {}
             }
         }
     };
