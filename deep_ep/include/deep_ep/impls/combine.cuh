@@ -154,31 +154,45 @@ combine_impl(nv_bfloat16* x,
         }
     };
 
-    const auto get_expected_receive_bytes_by_topk = [&](const int& src_rank_idx) {
-        constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
-        int num_expected_tokens = 0;
-        for (int token_idx = 0; token_idx < kNumMaxTokensPerRank; ++ token_idx) {
-            if (token_idx >= num_combined_tokens)
-                break;
-
-            bool has_src_rank = false;
-            #pragma unroll
-            for (int topk_slot_idx = 0; topk_slot_idx < kNumTopk; ++ topk_slot_idx) {
-                const auto expert_idx = static_cast<int>(__ldg(combined_topk_idx + token_idx * kNumTopk + topk_slot_idx));
-                const auto expert_rank_idx = expert_idx >= 0 ? expert_idx / kNumExpertsPerRank : -1;
-                has_src_rank |= expert_rank_idx == src_rank_idx;
-            }
-            num_expected_tokens += has_src_rank ? 1 : 0;
-        }
-        return static_cast<uint64_t>(num_expected_tokens) * token_bytes;
-    };
-
-    const auto wait_receive_counters_by_topk = [&](const int& wait_thread_idx, const int& num_wait_threads) {
+    const auto wait_receive_counters_by_topk = [&]() {
         if constexpr (kUseCFTCounted) {
-            for (int src_rank_idx = wait_thread_idx; src_rank_idx < kNumRanks; src_rank_idx += num_wait_threads) {
-                const auto expected_bytes = get_expected_receive_bytes_by_topk(src_rank_idx);
-                const auto counter_ptr = counter_layout.get_counter_ptr(src_rank_idx);
-                while (ptx::ld_relaxed_sys(counter_ptr) < expected_bytes) {}
+            // All counted sends are drained before this point, so block 0 can
+            // reuse shared memory to compute receiver-side expected counts.
+            __syncthreads();
+            if (sm_idx == 0) {
+                EP_STATIC_ASSERT(kNumRanks <= 32, "Insufficient rank mask width");
+                constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
+                auto expected_token_count = reinterpret_cast<int*>(smem);
+
+                for (int src_rank_idx = thread_idx; src_rank_idx < kNumRanks; src_rank_idx += kNumThreads)
+                    expected_token_count[src_rank_idx] = 0;
+                __syncthreads();
+
+                for (int token_idx = thread_idx; token_idx < num_combined_tokens; token_idx += kNumThreads) {
+                    unsigned rank_mask = 0;
+                    #pragma unroll
+                    for (int topk_slot_idx = 0; topk_slot_idx < kNumTopk; ++ topk_slot_idx) {
+                        const auto expert_idx =
+                            static_cast<int>(__ldg(combined_topk_idx + token_idx * kNumTopk + topk_slot_idx));
+                        const auto expert_rank_idx = expert_idx >= 0 ? expert_idx / kNumExpertsPerRank : -1;
+                        if (expert_rank_idx >= 0)
+                            rank_mask |= 1u << expert_rank_idx;
+                    }
+                    while (rank_mask) {
+                        const auto src_rank_idx = __ffs(rank_mask) - 1;
+                        rank_mask ^= 1u << src_rank_idx;
+                        atomicAdd_block(expected_token_count + src_rank_idx, 1);
+                    }
+                }
+                __syncthreads();
+
+                // A single block waits for all per-source counters. Kernel
+                // completion then orders the dependent epilogue launch.
+                for (int src_rank_idx = thread_idx; src_rank_idx < kNumRanks; src_rank_idx += kNumThreads) {
+                    const auto expected_bytes = static_cast<uint64_t>(expected_token_count[src_rank_idx]) * token_bytes;
+                    const auto counter_ptr = counter_layout.get_counter_ptr(src_rank_idx);
+                    while (ptx::ld_relaxed_sys(counter_ptr) < expected_bytes) {}
+                }
             }
         }
     };
@@ -377,9 +391,7 @@ combine_impl(nv_bfloat16* x,
             flush_pending_counted_send();
         __syncwarp();
 
-        const auto global_thread_idx = sm_idx * kNumThreads + thread_idx;
-        constexpr int kNumGridThreads = kNumSMs * kNumThreads;
-        wait_receive_counters_by_topk(global_thread_idx, kNumGridThreads);
+        wait_receive_counters_by_topk();
     } else {
         // Final barrier to ensure data arrival
         comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
