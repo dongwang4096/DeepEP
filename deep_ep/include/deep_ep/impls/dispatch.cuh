@@ -311,8 +311,8 @@ dispatch_impl(
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
             if constexpr (kUseCFTCounted) {
-                ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
                 wait_receive_counters_by_count(rank_count, thread_idx, kNumNotifyThreads);
+                ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
             }
         }
     } else {
@@ -540,6 +540,7 @@ dispatch_impl(
             const auto global_thread_idx = sm_idx * kNumThreads + thread_idx;
             constexpr int kNumGridThreads = kNumSMs * kNumThreads;
             wait_receive_counters_by_psum(global_thread_idx, kNumGridThreads);
+            cooperative_groups::this_grid().sync();
         }
     } else {
         // Barrier to ensure data arrival
@@ -548,8 +549,17 @@ dispatch_impl(
             gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
     }
 
-    // Trigger the copy epilogue kernel
-    cudaTriggerProgrammaticLaunchCompletion();
+    // Trigger the copy epilogue only after the receive buffers are complete.
+    if constexpr (kUseCFTCounted) {
+        if constexpr (kNumNotifyWarps == 0) {
+            cudaTriggerProgrammaticLaunchCompletion();
+        } else {
+            if (sm_idx == 0 and thread_idx == 0)
+                cudaTriggerProgrammaticLaunchCompletion();
+        }
+    } else {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 
     // Clean atomic counters
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
